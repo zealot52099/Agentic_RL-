@@ -1303,4 +1303,46 @@ Initial health:
 | 1 | 0.3787 | 0.3787 | 0.4913 | 0.00 | `8.33e-9` | 53.9 | 16.20 GiB |
 | 5 | 0.5542 | 0.4085 | 0.3621 | 0.75 | `2.50e-8` | 130.5 | 16.35 GiB |
 
-Interpretation: training started normally on 16 PPU after stopping `run_gpu_16.sh`. No NaN/OOM/PCCL/NCCL errors appeared in the first metrics window. The post-training queue will merge the adapter, run corrected WikiSQL v2 evaluation, and restart `run_gpu_16.sh` only if no project task is active.
+Final training status:
+
+| Metric | Value |
+|---|---:|
+| Final step | 900 / 900 |
+| Final loss EMA | 0.4638 |
+| Step loss | 0.5990 |
+| Grad norm | 0.4877 |
+| Clipped step rate | 0.00 |
+| Supervised tokens/s | 238.1 |
+| Max memory | 17.24 GiB |
+
+Artifacts:
+
+```text
+runs/phase18_canonical_data_agent_sft_20260702_155000_phase18/phase18_canonical_data_agent_sft_20260702_155000_phase18_lora/adapter
+evals/phase18_canonical_data_agent_sft_20260702_155000_phase18/merged/phase18_canonical_data_agent_sft_merged
+```
+
+Corrected WikiSQL v2 post-eval:
+
+| Metric | Value |
+|---|---:|
+| Samples | 256 |
+| SQL extraction rate | 100.00% |
+| Execution rate | 96.09% |
+| Execution accuracy | 52.73% |
+| Normalized SQL exact | 0.00% |
+
+Error categories:
+
+| Category | Count |
+|---|---:|
+| correct_execution | 135 |
+| wrong_where_or_value_or_column | 69 |
+| wrong_missing_aggregation | 40 |
+| exec_error_original_header_or_bad_identifier | 9 |
+| wrong_extra_aggregation | 2 |
+| exec_error_syntax | 1 |
+
+Evaluation note: the first vLLM run failed because `evaluate_wikisql_v2.py` generated all 256 prompts in one call and the PPU engine died during generation. The evaluator now supports `--batch-size`; Phase18 was evaluated with `--batch-size 16` and `--gpu-memory-utilization 0.20`. A separate premature `run_gpu_16.sh` keepalive also occupied memory during one retry and was stopped before the successful run.
+
+Interpretation: Phase18 did not recover the Phase8 SQL-only peak, but it improved over the corrected Phase16c v2 baseline from 50.78% to 52.73% execution accuracy while keeping extraction at 100% and execution rate high. The remaining dominant errors are semantic SQL errors: WHERE/value/column grounding and missing aggregation. Next SQL-focused work should add stronger schema/value grounding and execution-feedback repair/RL data rather than only more canonical SFT.

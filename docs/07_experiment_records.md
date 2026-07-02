@@ -1346,3 +1346,35 @@ Error categories:
 Evaluation note: the first vLLM run failed because `evaluate_wikisql_v2.py` generated all 256 prompts in one call and the PPU engine died during generation. The evaluator now supports `--batch-size`; Phase18 was evaluated with `--batch-size 16` and `--gpu-memory-utilization 0.20`. A separate premature `run_gpu_16.sh` keepalive also occupied memory during one retry and was stopped before the successful run.
 
 Interpretation: Phase18 did not recover the Phase8 SQL-only peak, but it improved over the corrected Phase16c v2 baseline from 50.78% to 52.73% execution accuracy while keeping extraction at 100% and execution rate high. The remaining dominant errors are semantic SQL errors: WHERE/value/column grounding and missing aggregation. Next SQL-focused work should add stronger schema/value grounding and execution-feedback repair/RL data rather than only more canonical SFT.
+
+## 2026-07-02: Phase19 SQL Schema/Value Grounding SFT
+
+Problem: Phase18 still fails mainly on semantic SQL grounding, not output format. The largest corrected WikiSQL v2 error buckets are `wrong_where_or_value_or_column` and `wrong_missing_aggregation`.
+
+Plan:
+
+| Item | Design |
+|---|---|
+| Data source | `datasets/processed/phase8_swift_wikisql_grpo_20260629/train.jsonl` plus Phase18 replay |
+| Eval leakage control | The fixed 256-row corrected WikiSQL v2 probe remains eval-only |
+| Data construction | Render schema as physical `colN`, header comments, sample rows, explicit `GROUNDING_HINTS`, relevant columns, candidate values, and required aggregations |
+| Repair traces | Synthetic previous SQL errors: missing aggregation, dropped WHERE, wrong value |
+| Retention | Mix low-weight Phase18 tool/multi-turn replay |
+| Base model | Phase18 merged model |
+| Training | 16-PPU LoRA SFT, 700 steps, LR `1.5e-7`, rank 32 |
+| Post-eval | Corrected WikiSQL v2 with batched vLLM evaluation (`--batch-size 16`) |
+
+New scripts:
+
+```text
+scripts/remote/prepare_phase19_sql_grounding_data.py
+scripts/remote/run_phase19_sql_grounding_sft_ppu16.sh
+```
+
+Expected improvement path:
+
+1. `missing_aggregation` should fall because prompts explicitly label required `MIN/MAX/COUNT/SUM/AVG`.
+2. `wrong_where_or_value_or_column` should fall because prompts include relevant columns and candidate cell values instead of relying on implicit schema matching.
+3. Execution rate should stay high because output remains the same Data Agent `run_sql` action schema.
+
+Risk: this stage is more SQL-specialized than Phase18. Tool-call and multi-turn metrics may need a short retention run if they regress; Phase19 therefore includes Phase18 replay but does not over-weight it.

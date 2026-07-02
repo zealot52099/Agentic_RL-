@@ -1378,3 +1378,45 @@ Expected improvement path:
 3. Execution rate should stay high because output remains the same Data Agent `run_sql` action schema.
 
 Risk: this stage is more SQL-specialized than Phase18. Tool-call and multi-turn metrics may need a short retention run if they regress; Phase19 therefore includes Phase18 replay but does not over-weight it.
+
+## 2026-07-02: SQL Auto-Loop Controller
+
+Goal: implement an automatic loop for SQL-focused optimization:
+
+```text
+train/eval run finishes
+  -> parse corrected WikiSQL v2 metrics
+  -> analyze dominant error category
+  -> write a next-round plan
+  -> launch the next training run only if the metric improved enough
+  -> evaluate again
+  -> stop and start run_gpu_16.sh when improvement stalls or target is reached
+```
+
+New scripts:
+
+```text
+scripts/remote/auto_sql_grounding_loop.py
+scripts/remote/run_auto_sql_grounding_loop.sh
+```
+
+Default policy:
+
+| Rule | Action |
+|---|---|
+| Current run has no WikiSQL v2 metrics yet | Wait and keep polling |
+| Execution accuracy reaches `62%` | Stop loop and start `run_gpu_16.sh` keepalive |
+| Gain vs previous round is below `0.5 pp` | Stop loop and start keepalive |
+| Metrics improved and target not reached | Launch another Phase19-style SQL grounding SFT round from the latest merged model |
+| Dominant error is `wrong_missing_aggregation` | Add a small step budget bump for the next round |
+| Dominant error is `wrong_where_or_value_or_column` | Add a smaller step budget bump for schema/value grounding |
+
+State files:
+
+```text
+runs/auto_sql_grounding_loop/state.json
+runs/auto_sql_grounding_loop/latest_plan.json
+runs/auto_sql_grounding_loop/auto_loop.log
+```
+
+This controller is deliberately conservative. It does not launch a new round on regressions, missing metrics, or missing merged model paths. It also does not train on the fixed 256-row corrected WikiSQL v2 probe; that probe remains eval-only.

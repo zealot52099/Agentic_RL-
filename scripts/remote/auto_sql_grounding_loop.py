@@ -8,9 +8,11 @@ The loop implements:
 
 It is intentionally rule-based and conservative. It only launches a new round
 when the last round has completed, produced a WikiSQL v2 metrics file, improved
-over the previous baseline by at least ``min_gain``, and has not exceeded
-``max_rounds``. If the signal stalls or regresses, it starts ``run_gpu_16.sh``
-as a resource keepalive and exits.
+SQL execution accuracy over the previous baseline by at least ``min_gain``,
+passed the tool-call guardrail, and has not exceeded ``max_rounds``. Normalized
+SQL exact is recorded as a diagnostic only; it is not an optimization gate. If
+the signal stalls/regresses or tool-call ability falls below the guardrail, it
+starts ``run_gpu_16.sh`` as a resource keepalive and exits.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from typing import Any
 
 ROOT = Path("/workspace/yans2@xiaopeng.com/agentic_rl_pipeline")
 PHASE19_PREFIX = "phase19_sql_grounding_sft_"
+PHASE16C_PREFIX = "phase16c_sql_execution_grpo_"
 
 
 @dataclass
@@ -42,6 +45,11 @@ class RoundState:
     execution_rate: float | None = None
     extraction_rate: float | None = None
     normalized_sql_exact: float | None = None
+    tool_metrics_path: str | None = None
+    tool_json_parse_rate: float | None = None
+    tool_unordered_exact: float | None = None
+    tool_names_exact: float | None = None
+    tool_call_count_exact: float | None = None
     dominant_error: str | None = None
     next_action: str | None = None
     reason: str | None = None
@@ -99,8 +107,31 @@ def find_wikisql_metrics(run_name: str) -> Path | None:
     root = eval_root(run_name)
     candidates = sorted(root.glob("**/*wikisql*v2*metrics.json"))
     if not candidates:
+        candidates = sorted(root.glob("**/*wikisql*/*metrics.json"))
+    if not candidates:
+        candidates = sorted(root.glob("**/*wikisql*metrics.json"))
+    if not candidates:
         candidates = sorted(root.glob("**/*metrics.json"))
     return candidates[-1] if candidates else None
+
+
+def find_tool_metrics(run_name: str) -> Path | None:
+    root = eval_root(run_name)
+    candidates = sorted(root.glob("**/*tool*metrics.json"))
+    return candidates[-1] if candidates else None
+
+
+def find_tool_guard_dataset() -> Path | None:
+    candidates = [
+        ROOT / "datasets/processed/phase16_followup_assets_20260701/data_agent_tool_action_probe.jsonl",
+        ROOT / "datasets/processed/phase18_canonical_data_agent_sft_20260702_155000_phase18/validation.jsonl",
+        ROOT / "datasets/processed/phase19_sql_grounding_sft_20260702_220500_phase19/validation.jsonl",
+    ]
+    for path in candidates:
+        if path.exists() and path.stat().st_size > 0:
+            return path
+    found = sorted(ROOT.glob("datasets/**/*tool*probe*.jsonl"))
+    return found[0] if found else None
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -124,6 +155,8 @@ def run_completed(run_name: str) -> bool:
     if queue_logs:
         text = "\n".join(path.read_text(encoding="utf-8", errors="replace")[-4000:] for path in queue_logs)
         if "post-eval completed" in text or "and post-eval completed" in text:
+            return True
+        if "training and post-eval completed" in text:
             return True
     return bool(find_wikisql_metrics(run_name))
 
@@ -151,6 +184,84 @@ def state_from_metrics(round_index: int, run_name: str, metrics_path: Path) -> R
     )
 
 
+def ensure_tool_metrics(run_name: str, model_path: str | None, log_path: Path) -> Path | None:
+    existing = find_tool_metrics(run_name)
+    if existing:
+        return existing
+    if not model_path:
+        log(log_path, f"skip tool guard eval for {run_name}: missing merged model path")
+        return None
+    dataset = find_tool_guard_dataset()
+    if not dataset:
+        log(log_path, f"skip tool guard eval for {run_name}: no tool guard dataset found")
+        return None
+    output_dir = eval_root(run_name) / "tool_action_guard"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    label = f"{run_name}_tool_guard"
+    cmd = [
+        "/opt/ac2/bin/python",
+        "scripts/remote/evaluate_xlam_tool_calls.py",
+        "--model",
+        model_path,
+        "--dataset",
+        str(dataset),
+        "--output-dir",
+        str(output_dir),
+        "--model-label",
+        label,
+        "--max-model-len",
+        "4096",
+        "--gpu-memory-utilization",
+        "0.20",
+        "--batch-size",
+        "16",
+    ]
+    log(log_path, f"running tool guard eval for {run_name} dataset={dataset}")
+    result = run(cmd)
+    (output_dir / "tool_guard_eval.log").write_text(result.stdout, encoding="utf-8")
+    if result.returncode != 0:
+        log(log_path, f"tool guard eval failed for {run_name}; see {output_dir / 'tool_guard_eval.log'}")
+        return None
+    return find_tool_metrics(run_name)
+
+
+def attach_tool_metrics(state: RoundState, tool_metrics_path: Path | None) -> None:
+    if not tool_metrics_path:
+        return
+    metrics = read_json(tool_metrics_path)
+    state.tool_metrics_path = str(tool_metrics_path)
+    state.tool_json_parse_rate = metrics.get("json_parse_rate")
+    state.tool_unordered_exact = metrics.get("unordered_exact")
+    state.tool_names_exact = metrics.get("tool_names_exact")
+    state.tool_call_count_exact = metrics.get("call_count_exact")
+
+
+def tool_guard_passed(
+    state: RoundState,
+    *,
+    min_tool_json_parse: float,
+    min_tool_names_exact: float,
+    min_tool_call_count_exact: float,
+) -> tuple[bool, str]:
+    missing = []
+    if state.tool_json_parse_rate is None:
+        missing.append("json_parse_rate")
+    if state.tool_names_exact is None:
+        missing.append("tool_names_exact")
+    if state.tool_call_count_exact is None:
+        missing.append("call_count_exact")
+    if missing:
+        return False, "missing tool guard metrics: " + ",".join(missing)
+    failures = []
+    if float(state.tool_json_parse_rate) < min_tool_json_parse:
+        failures.append(f"json_parse_rate {state.tool_json_parse_rate:.4f} < {min_tool_json_parse:.4f}")
+    if float(state.tool_names_exact) < min_tool_names_exact:
+        failures.append(f"tool_names_exact {state.tool_names_exact:.4f} < {min_tool_names_exact:.4f}")
+    if float(state.tool_call_count_exact) < min_tool_call_count_exact:
+        failures.append(f"call_count_exact {state.tool_call_count_exact:.4f} < {min_tool_call_count_exact:.4f}")
+    return (not failures, "; ".join(failures) if failures else "passed")
+
+
 def launch_next_round(
     *,
     base_model: str,
@@ -174,6 +285,31 @@ def launch_next_round(
     return run_name
 
 
+def launch_grpo_round(
+    *,
+    base_model: str,
+    round_index: int,
+    steps: int,
+    lr: float,
+    log_path: Path,
+) -> str:
+    stamp = time.strftime("%Y%m%d_%H%M%S") + f"_auto{round_index}_sql_grpo"
+    env = os.environ.copy()
+    env["BASE_MODEL"] = base_model
+    env["MAX_STEPS"] = str(steps)
+    env["LR"] = f"{lr:.2e}"
+    env["REPORT_TO"] = env.get("REPORT_TO", "swanlab")
+    env["SWANLAB_MODE"] = env.get("SWANLAB_MODE", "local")
+    cmd = ["bash", "scripts/remote/run_phase16c_sql_grpo_ppu16.sh", stamp]
+    stdout = ROOT / "logs" / f"auto_sql_loop_launch_{stamp}.log"
+    stdout.parent.mkdir(parents=True, exist_ok=True)
+    with stdout.open("w", encoding="utf-8") as handle:
+        proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=handle, stderr=subprocess.STDOUT)
+    run_name = PHASE16C_PREFIX + stamp
+    log(log_path, f"launched GRPO round {run_name} pid={proc.pid} base={base_model} steps={steps} lr={lr:.2e}")
+    return run_name
+
+
 def write_state(state_path: Path, data: dict[str, Any]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -185,7 +321,12 @@ def main() -> None:
     parser.add_argument("--baseline-accuracy", type=float, default=0.52734375)
     parser.add_argument("--target-accuracy", type=float, default=0.62)
     parser.add_argument("--min-gain", type=float, default=0.005)
+    parser.add_argument("--min-tool-json-parse", type=float, default=0.95)
+    parser.add_argument("--min-tool-names-exact", type=float, default=0.90)
+    parser.add_argument("--min-tool-call-count-exact", type=float, default=0.90)
     parser.add_argument("--max-rounds", type=int, default=3)
+    parser.add_argument("--grpo-steps", type=int, default=600)
+    parser.add_argument("--grpo-lr", type=float, default=8e-8)
     parser.add_argument("--poll-seconds", type=int, default=300)
     parser.add_argument("--state-dir", type=Path, default=ROOT / "runs" / "auto_sql_grounding_loop")
     parser.add_argument("--dry-run", action="store_true")
@@ -228,20 +369,48 @@ def main() -> None:
             return
 
         state = state_from_metrics(round_index, current_run, metrics_path)
+        attach_tool_metrics(state, ensure_tool_metrics(current_run, state.model_path, log_path))
         acc = float(state.execution_accuracy or 0.0)
         gain = acc - previous_accuracy
+        tool_ok, tool_reason = tool_guard_passed(
+            state,
+            min_tool_json_parse=args.min_tool_json_parse,
+            min_tool_names_exact=args.min_tool_names_exact,
+            min_tool_call_count_exact=args.min_tool_call_count_exact,
+        )
 
         plan = {
             "round": round_index,
             "current_run": current_run,
             "metrics_path": str(metrics_path),
             "execution_accuracy": acc,
+            "execution_rate": state.execution_rate,
+            "normalized_sql_exact_diagnostic": state.normalized_sql_exact,
             "previous_accuracy": previous_accuracy,
             "gain": gain,
+            "tool_metrics_path": state.tool_metrics_path,
+            "tool_json_parse_rate": state.tool_json_parse_rate,
+            "tool_names_exact": state.tool_names_exact,
+            "tool_call_count_exact": state.tool_call_count_exact,
+            "tool_unordered_exact": state.tool_unordered_exact,
+            "tool_guard_passed": tool_ok,
+            "tool_guard_reason": tool_reason,
             "dominant_error": state.dominant_error,
+            "objective": "maximize SQL execution accuracy and repair success; enforce tool-call guardrails; normalized SQL exact is diagnostic only",
             "decision": None,
             "next": None,
         }
+
+        if not tool_ok:
+            state.next_action = "stop_tool_guard_failed"
+            state.reason = tool_reason
+            plan["decision"] = state.next_action
+            history.append(asdict(state))
+            write_state(state_path, {"status": "stopped_tool_guard_failed", "history": history, "updated_at": now()})
+            write_state(plan_path, plan)
+            log(log_path, state.reason)
+            start_keepalive(log_path)
+            return
 
         if acc >= args.target_accuracy:
             state.next_action = "stop_target_reached"
@@ -254,6 +423,41 @@ def main() -> None:
             return
 
         if gain < args.min_gain:
+            model = state.model_path
+            can_switch_to_grpo = (
+                bool(model)
+                and not current_run.startswith(PHASE16C_PREFIX)
+                and round_index < args.max_rounds
+            )
+            if can_switch_to_grpo:
+                plan["decision"] = "switch_to_sql_execution_grpo"
+                plan["next"] = {
+                    "base_model": model,
+                    "steps": args.grpo_steps,
+                    "learning_rate": args.grpo_lr,
+                    "reason": (
+                        f"execution gain {gain:.4f} < min_gain {args.min_gain:.4f}; "
+                        "switch from grounding SFT to execution-reward GRPO"
+                    ),
+                }
+                state.next_action = "switch_to_sql_execution_grpo"
+                state.reason = str(plan["next"]["reason"])
+                history.append(asdict(state))
+                write_state(plan_path, plan)
+                write_state(state_path, {"status": "launching_grpo_round", "history": history, "latest_plan": plan, "updated_at": now()})
+                if args.dry_run:
+                    log(log_path, "dry-run enabled; not launching GRPO round")
+                    return
+                current_run = launch_grpo_round(
+                    base_model=model,
+                    round_index=round_index + 1,
+                    steps=args.grpo_steps,
+                    lr=args.grpo_lr,
+                    log_path=log_path,
+                )
+                time.sleep(30)
+                continue
+
             state.next_action = "stop_low_gain"
             state.reason = f"gain {gain:.4f} < min_gain {args.min_gain:.4f}"
             plan["decision"] = state.next_action
@@ -288,7 +492,7 @@ def main() -> None:
             "base_model": model,
             "steps": next_steps,
             "learning_rate": next_lr,
-            "reason": "metric improved and target not reached; continue with lower LR SQL grounding SFT",
+            "reason": "execution accuracy improved, tool-call guard passed, and target not reached; continue lower-LR SQL grounding SFT with replay",
         }
         state.next_action = "continue_sql_grounding_sft"
         state.reason = str(plan["next"]["reason"])

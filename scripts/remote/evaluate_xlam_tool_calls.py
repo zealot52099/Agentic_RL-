@@ -46,7 +46,12 @@ def parse_response(text: str) -> tuple[list[dict[str, Any]] | None, str]:
     except json.JSONDecodeError:
         return None, "json_decode_error"
 
-    if isinstance(value, dict) and "tool_calls" in value:
+    if isinstance(value, dict) and value.get("action") in {"tool_call", "no_tool", "clarify"}:
+        if value.get("action") == "tool_call":
+            value = value.get("calls") or value.get("tool_calls") or []
+        else:
+            value = []
+    elif isinstance(value, dict) and "tool_calls" in value:
         value = value["tool_calls"]
     if isinstance(value, dict):
         value = [value]
@@ -67,6 +72,37 @@ def unordered(calls: list[dict[str, Any]]) -> list[str]:
     return sorted(canonical([call]) for call in calls)
 
 
+def expected_calls_from_row(row: dict[str, Any]) -> list[dict[str, Any]]:
+    if "expected_calls" in row:
+        return row["expected_calls"]
+    expected = row.get("expected")
+    if isinstance(expected, dict) and expected.get("action") in {"tool_call", "no_tool", "clarify"}:
+        if expected.get("action") == "tool_call":
+            calls = [normalize_call(item) for item in expected.get("calls", [])]
+            if all(call is not None for call in calls):
+                return calls  # type: ignore[return-value]
+        else:
+            return []
+    completion = row.get("completion")
+    if isinstance(completion, str):
+        try:
+            value = json.loads(completion)
+        except json.JSONDecodeError:
+            value = None
+        if isinstance(value, dict):
+            if value.get("action") == "tool_call" and isinstance(value.get("tool_call"), dict):
+                call = value["tool_call"]
+                name = call.get("name") or call.get("tool")
+                arguments = call.get("arguments", {})
+                if isinstance(name, str) and isinstance(arguments, dict):
+                    return [{"name": name, "arguments": arguments}]
+            if isinstance(value.get("tool_calls"), list):
+                calls = [normalize_call(item) for item in value["tool_calls"]]
+                if all(call is not None for call in calls):
+                    return calls  # type: ignore[return-value]
+    raise KeyError("row must contain expected_calls or a parseable tool-call completion")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -76,6 +112,7 @@ def main() -> None:
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--max-tokens", type=int, default=192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.75)
+    parser.add_argument("--batch-size", type=int, default=256)
     args = parser.parse_args()
 
     rows = [
@@ -100,7 +137,9 @@ def main() -> None:
         temperature=0.0,
         max_tokens=args.max_tokens,
     )
-    outputs = llm.generate(prompts, sampling, use_tqdm=True)
+    outputs = []
+    for start in range(0, len(prompts), args.batch_size):
+        outputs.extend(llm.generate(prompts[start : start + args.batch_size], sampling, use_tqdm=True))
     elapsed = time.time() - started
 
     counters = Counter()
@@ -108,7 +147,7 @@ def main() -> None:
     for row, output in zip(rows, outputs, strict=True):
         text = output.outputs[0].text
         predicted, parse_status = parse_response(text)
-        expected = row["expected_calls"]
+        expected = expected_calls_from_row(row)
         counters["total"] += 1
         counters[f"parse_{parse_status}"] += 1
 
@@ -129,7 +168,7 @@ def main() -> None:
         predictions.append(
             {
                 "id": row["id"],
-                "family": row["family"],
+                "family": row.get("family") or row.get("source") or row.get("mixture_source") or "unknown",
                 "expected_calls": expected,
                 "raw_response": text,
                 "parsed_calls": predicted,

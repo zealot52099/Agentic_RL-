@@ -1381,14 +1381,20 @@ Risk: this stage is more SQL-specialized than Phase18. Tool-call and multi-turn 
 
 ## 2026-07-02: SQL Auto-Loop Controller
 
-Goal: implement an automatic loop for SQL-focused optimization:
+Goal: implement an automatic loop for SQL-focused optimization. After reviewing
+`normalized_sql_exact`, the optimization target was narrowed to the product
+objective: **improve SQL execution accuracy / repair success while keeping
+tool-call ability within guardrails**. Normalized SQL exact remains logged as a
+diagnostic for schema/format mismatch, but it is no longer a gate for continuing
+or stopping training.
 
 ```text
 train/eval run finishes
   -> parse corrected WikiSQL v2 metrics
+  -> run tool-call guard evaluation
   -> analyze dominant error category
   -> write a next-round plan
-  -> launch the next training run only if the metric improved enough
+  -> launch the next training run only if execution accuracy improved enough and tool-call guardrails pass
   -> evaluate again
   -> stop and start run_gpu_16.sh when improvement stalls or target is reached
 ```
@@ -1407,9 +1413,32 @@ Default policy:
 | Current run has no WikiSQL v2 metrics yet | Wait and keep polling |
 | Execution accuracy reaches `62%` | Stop loop and start `run_gpu_16.sh` keepalive |
 | Gain vs previous round is below `0.5 pp` | Stop loop and start keepalive |
+| Tool JSON parse rate below `95%` | Stop loop and start keepalive |
+| Tool name exact below `90%` | Stop loop and start keepalive |
+| Tool call-count exact below `90%` | Stop loop and start keepalive |
 | Metrics improved and target not reached | Launch another Phase19-style SQL grounding SFT round from the latest merged model |
+| Grounding SFT gain below `0.5 pp` and tool guard passes | Switch to SQL execution GRPO from the latest merged model |
+| GRPO gain below `0.5 pp` | Stop loop, keep metrics for manual recipe redesign, and start keepalive |
 | Dominant error is `wrong_missing_aggregation` | Add a small step budget bump for the next round |
 | Dominant error is `wrong_where_or_value_or_column` | Add a smaller step budget bump for schema/value grounding |
+| Normalized SQL exact changes | Record only; do not optimize it if execution accuracy or tool-call ability would regress |
+
+Tool unordered/full-action exact is still logged, but it is not a hard
+guardrail for this SQL loop because the current guard set includes SQL tool
+calls, and exact SQL argument comparison can drop even when tool routing and
+JSON structure are preserved. For tool retention, the hard checks are therefore
+JSON parse, selected tool name, and call count.
+
+Auto redesign rule added after Phase19: a bad or flat SQL result should not just
+stop the loop. If schema/value-grounding SFT does not improve execution accuracy
+and tool-call guardrails pass, the controller now launches a SQL execution GRPO
+round from the latest merged model. That GRPO round is then evaluated with the
+same SQL metrics and tool-call guardrails before the loop decides whether to
+continue or stop. This creates the intended closed cycle:
+
+```text
+evaluate -> analyze failure mode -> choose next recipe -> train -> evaluate -> analyze
+```
 
 State files:
 
@@ -1420,3 +1449,12 @@ runs/auto_sql_grounding_loop/auto_loop.log
 ```
 
 This controller is deliberately conservative. It does not launch a new round on regressions, missing metrics, or missing merged model paths. It also does not train on the fixed 256-row corrected WikiSQL v2 probe; that probe remains eval-only.
+
+Rationale: SQL exact-match is useful for diagnosing formatting and schema
+grounding, but it can penalize semantically equivalent SQL. For a Data Agent, the
+acceptance hierarchy is now:
+
+1. SQL execution accuracy and executable rate.
+2. SQL repair success once execution feedback is available.
+3. Tool-call / Data Agent action retention.
+4. Normalized SQL exact as a diagnostic signal only.

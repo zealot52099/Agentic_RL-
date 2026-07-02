@@ -9,6 +9,11 @@ STATE_DIR="${STATE_DIR:-$ROOT/runs/auto_sql_grounding_loop}"
 MAX_ROUNDS="${MAX_ROUNDS:-3}"
 MIN_GAIN="${MIN_GAIN:-0.005}"
 TARGET_ACCURACY="${TARGET_ACCURACY:-0.62}"
+GRPO_STEPS="${GRPO_STEPS:-600}"
+GRPO_LR="${GRPO_LR:-8e-8}"
+MIN_TOOL_JSON_PARSE="${MIN_TOOL_JSON_PARSE:-0.95}"
+MIN_TOOL_NAMES_EXACT="${MIN_TOOL_NAMES_EXACT:-0.90}"
+MIN_TOOL_CALL_COUNT_EXACT="${MIN_TOOL_CALL_COUNT_EXACT:-0.90}"
 POLL_SECONDS="${POLL_SECONDS:-300}"
 BASELINE_ACCURACY="${BASELINE_ACCURACY:-0.52734375}"
 
@@ -27,7 +32,12 @@ nohup /opt/ac2/bin/python scripts/remote/auto_sql_grounding_loop.py \
   --baseline-accuracy "$BASELINE_ACCURACY" \
   --target-accuracy "$TARGET_ACCURACY" \
   --min-gain "$MIN_GAIN" \
+  --min-tool-json-parse "$MIN_TOOL_JSON_PARSE" \
+  --min-tool-names-exact "$MIN_TOOL_NAMES_EXACT" \
+  --min-tool-call-count-exact "$MIN_TOOL_CALL_COUNT_EXACT" \
   --max-rounds "$MAX_ROUNDS" \
+  --grpo-steps "$GRPO_STEPS" \
+  --grpo-lr "$GRPO_LR" \
   --poll-seconds "$POLL_SECONDS" \
   --state-dir "$STATE_DIR" \
   > "$STATE_DIR/auto_loop.stdout.log" 2>&1 &

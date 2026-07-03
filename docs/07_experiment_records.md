@@ -1440,6 +1440,53 @@ continue or stop. This creates the intended closed cycle:
 evaluate -> analyze failure mode -> choose next recipe -> train -> evaluate -> analyze
 ```
 
+## 2026-07-03: Phase20 On-Policy Distillation Plan
+
+Motivation: Phase16c GRPO improved SQL execution accuracy from 52.73% to 60.16%,
+while another grounding SFT round regressed to 52.34%. This suggests that
+ordinary offline SFT can pull the model away from the execution-optimized policy.
+The next experiment therefore uses on-policy distillation from the current best
+model rather than more static SFT.
+
+Teacher assessment:
+
+| Candidate | Status | Decision |
+|---|---|---|
+| QwQ/Qwen 32B+ local directories | Present under `/publicdata/huggingface.co/Qwen` | Not yet validated as a stable PPU/vLLM teacher for this pipeline |
+| Current best Phase16c model | Validated and executable | Used for on-policy rollout |
+| SQLite/gold-result verifier | Deterministic | Used as the quality gate |
+
+Because no external teacher is currently proven reliable, Phase20 does **not**
+trust unverified teacher text. It uses execution-verified self-rollout:
+
+```text
+Phase16c best model
+  -> sample N SQL completions per prompt
+  -> execute each candidate in a SQLite sandbox
+  -> keep successful on-policy SQL as imitation data
+  -> convert failed rollout into repair prompt with previous SQL + execution feedback
+  -> target the gold SQL only because it is verified against gold result
+  -> mix tool-call replay to protect Data Agent action behavior
+```
+
+Expected advantage over more GRPO:
+
+| Method | Strength | Risk |
+|---|---|---|
+| GRPO | Directly optimizes execution reward and already worked | Rollouts are expensive; high zero-std groups reduce learning signal |
+| OPD | Converts model's own failures into dense supervised repair signal | Can regress if too much gold/static SFT is mixed |
+
+Acceptance rule: Phase20 is only useful if it beats the Phase16c best SQL
+execution accuracy of 60.16% without violating tool guardrails. Normalized SQL
+exact remains diagnostic only.
+
+New scripts:
+
+```text
+scripts/remote/prepare_phase20_on_policy_distill_data.py
+scripts/remote/run_phase20_on_policy_distill_sft_ppu16.sh
+```
+
 State files:
 
 ```text

@@ -56,6 +56,22 @@ def extract_sql(text: str) -> str | None:
     return value
 
 
+def remap_headers(sql: str, headers: list) -> str:
+    """Remap display header names to colN identifiers (quoted + unquoted)."""
+    for i, h in enumerate(headers):
+        col = f"col{i}"
+        h_str = str(h).strip()
+        if not h_str or h_str.startswith("col"):
+            continue
+        # Quoted: "DisplayName" -> "colN"
+        sql = sql.replace(chr(34) + h_str + chr(34), chr(34) + col + chr(34))
+        sql = sql.replace(chr(34) + h_str.lower() + chr(34), chr(34) + col + chr(34))
+        sql = sql.replace(chr(34) + h_str.upper() + chr(34), chr(34) + col + chr(34))
+        # Unquoted: bare DisplayName -> colN (word boundary)
+        sql = re.sub(r'\b' + re.escape(h_str) + r'\b', col, sql, flags=re.IGNORECASE)
+    return sql
+
+
 def normalized_sql(value: str) -> str:
     value = value.strip().rstrip(";")
     value = re.sub(r"\s+", " ", value)
@@ -139,6 +155,9 @@ def main() -> None:
     for row, output in zip(rows, outputs, strict=True):
         raw = output.outputs[0].text
         sql = extract_sql(raw)
+        # Apply header->colN remapping (quoted + unquoted identifiers)
+        if sql is not None and row.get("header"):
+            sql = remap_headers(sql, row["header"])
         error = None
         result = None
         if sql is not None:

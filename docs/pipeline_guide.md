@@ -1,127 +1,298 @@
-# Agentic RL Pipeline Guide
+# MCP Agent 训练评测流程
 
-本文档记录当前 `agentic_rl_pipeline` 的可执行路线。目标是在尚无业务数据前，先用开源数据统一成面向 Data Agent 的生产输出格式，提升工具调用、SQL 生成、澄清/拒答和安全边界能力。
+> 可复用的端到端 pipeline，适用于 Coder7B/Coder14B/其他模型迁移
 
-## 2026-06-26 Phase5: Unified Data Agent SFT
-
-### 目标
-
-Phase5 不再分别优化 BFCL/xLAM/Spider/WikiSQL 的原始输出格式，而是统一到 Data Agent 运行时更容易消费的 action schema：
-
-```json
-{"action":"tool_call","calls":[{"name":"execute_sql","arguments":{"database":"spider:<db_id>","sql":"SELECT ..."}}]}
-{"action":"tool_call","calls":[{"name":"mcp_server.tool_name","arguments":{"key":"value"}}]}
-{"action":"no_tool","calls":[]}
-{"action":"clarify","missing":["table_schema"],"message":"需要补充数据库表结构后才能生成可靠 SQL。"}
-```
-
-这样训练目标和后续生产解析器一致；官方 benchmark 仍单独保留原始格式评测，不能和内部统一格式指标混算。
-
-### 数据位置
-
-生成脚本：
-
-```text
-scripts/build_phase5_unified.py
-```
-
-远端输出：
-
-```text
-/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/processed/phase5_unified_20260626/train.jsonl
-/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/processed/phase5_unified_20260626/validation.jsonl
-/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/processed/phase5_unified_20260626/audit_examples.jsonl
-/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/processed/phase5_unified_20260626/manifest.json
-```
-
-当前 manifest 摘要：
-
-```json
-{
-  "schema": "data_agent_action_v1",
-  "counts": {"all": 15500, "train": 14962, "validation": 538},
-  "action_counts": {"tool_call": 13234, "no_tool": 1105, "clarify": 1161},
-  "source_plan": {"phase3": 6500, "mcp": 3500, "parallel": 2000, "spider": 3500}
-}
-```
-
-主要 mixture 包括：MCP 正样本、Spider SQL、WikiSQL/BFCL 风格 SQL、标准函数调用、并行工具调用、no-tool、clarify。Spider 当前本地文件缺少 `tables.json`/schema，因此只能训练 `execute_sql` 输出格式和 SQL 表达式，不能充分训练 schema linking。
-
-### 当前训练方案
-
-优先目标是先跑通稳定训练，再恢复 7B LoRA/QLoRA：
-
-```text
-model: /publicdata/huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct
-script: /workspace/yans2@xiaopeng.com/agentic_rl_pipeline/scripts/train_phase5_full_sft.py
-run: phase5_unified_coder15b_full_fp32_lr2e7_seed20260626_20260626_125859
-output: /workspace/yans2@xiaopeng.com/agentic_rl_pipeline/output/phase5_unified_coder15b_full_fp32_lr2e7_seed20260626_20260626_125859
-log: /workspace/yans2@xiaopeng.com/agentic_rl_pipeline/logs/phase5_unified_coder15b_full_fp32_lr2e7_seed20260626_20260626_125859.log
-steps: 300
-seq_len: 2048
-micro_batch_size: 1
-grad_accum_steps: 8
-learning_rate: 2e-7
-warmup_steps: 50
-dtype: fp32
-attention: sdpa
-optimizer: AdamW non-fused
-swanlab: local mode
-```
-
-SwanLab cloud 当前缺少 API key。local dashboard 可用：
+## 一、环境准备
 
 ```bash
-swanlab watch /workspace/yans2@xiaopeng.com/agentic_rl_pipeline/output/phase5_unified_coder15b_full_fp32_lr2e7_seed20260626_20260626_125859/swanlab
+# 硬件: 1-16 PPU/GPU，单卡 7B LoRA 约需 20GB 显存
+# 依赖: torch, transformers, peft, trl, swanlab, bfcl_eval, sqlparse
+
+pip install peft trl swanlab bfcl-eval sqlparse
 ```
 
-### 启动前资源处理
+## 二、数据准备
 
-本次启动前已终止占用 GPU 的旧 VLLM 进程：
+### 2.1 数据格式标准
 
-```text
-25922 25923 25924 25925
+**所有训练数据统一为一种格式**。推荐 OOD native 格式（训练=评测对齐）：
+
+```
+AVAILABLE FUNCTIONS:
+[{函数定义}]
+
+USER:
+{用户query}
+
+ASSISTANT:
+{completion}
 ```
 
-之后又终止了多次卡住的 Phase5 smoke run，避免 D 状态残留占用设备。
+### 2.2 必需数据源
 
-### 已遇到的问题
+| 数据源 | 数量 | 用途 | 来源 |
+|---|---|---|---|
+| MCP 工具调用 | 6K+ | 函数选择 | 自建/开源 |
+| 并行调用 | 2K | 数组输出 | MCP合成或开源 |
+| SQL 函数调用 | 3K | SQL 生成 | Spider + BFCL格式对齐 |
+| Math COT | 500 | 推理能力 | GSM8K |
+| Clarify/No-tool | 1.5K | 拒调/澄清 | MCP smoke |
 
-1. 7B LoRA 和 3B LoRA 在权重加载后卡住，没有写出 metrics。
-   - 现象：Python 子进程进入 `D` 状态，GPU 仅占用少量显存。
-   - 根因倾向：远端系统 Python 的 torch 栈被 pip 覆盖到 `torch 2.11.0+cu130`，而历史成功训练记录使用的是 `torch 2.8.0+ali.9.ppu2.0.0.cu129`。
-   - 处理：停止继续使用 PEFT 路径硬试，先启用不依赖 PEFT 的 1.5B 全参 fallback。
+### 2.3 格式规则（关键！）
 
-2. CPU 加载后 `.to(cuda)` 路径卡住。
-   - 现象：1.5B 全参 BF16 也卡在模型加载后。
-   - 处理：改为 `from_pretrained(device_map={"": 0})` 直接加载到 GPU，并将 attention 切到 `sdpa`。
+```python
+# ✅ 正确: 所有值用双层嵌套
+columns: [["name"], ["age"]]
+conditions: [["id = 1"]]
 
-3. SwanLab cloud 未配置 API key。
-   - 现象：`swanlab.init(mode="cloud")` 报 `api key not configured (no-tty)`。
-   - 处理：安装 `swanlab[dashboard]`，先用 `mode="local"` 保存可视化日志。要接入云端，需要在 job 中执行 `swanlab.login(api_key=...)` 或配置相应环境变量。
+# ❌ 错误: 单层
+columns: ["name", "age"]
 
-4. BF16 全参数训练 step 2 NaN。
-   - 现象：step 1 loss 有限但 grad_norm 为 NaN，step 2 loss 变 NaN。
-   - 处理：改为 FP32 参数、关闭 autocast、关闭 fused optimizer、学习率降到 `2e-7`。
+# ✅ 正确: function calling 用 name + arguments
+{"name": "query_records", "arguments": {"field": "project"}}
 
-### 当前健康信号
-
-稳定版已写出 metrics：
-
-```json
-{"step":1,"loss":0.783116240054369,"grad_norm":37.63218688964844,"lr":8e-09}
-{"step":10,"loss":0.6331170462071896,"grad_norm":35.20143127441406,"lr":4.4e-08}
-{"step":20,"loss":0.860849391669035,"grad_norm":26.396486282348633,"lr":8.4e-08}
+# ❌ 错误: MCP 格式(训练和评测不一致)
+[{"server_id": "database", "tool_name": "query_records", "arguments": {...}}]
 ```
 
-这只是训练稳定性指标，不是最终效果指标。完成后需要跑内部统一格式 eval 和官方格式 eval，并明确标注来源。
+### 2.4 禁止事项
 
-### 后续计划
+- ❌ 测试集数据**绝对不可**进入训练集
+- ❌ 不要在数据中混用多种 prompt 格式
+- ❌ 不要让 prompt 和 completion 格式矛盾（如在 prompt 说"输出 XML"但 completion 是 JSON）
 
-1. 等待 1.5B FP32 fallback 完成 300 step，检查 loss 曲线、JSON/action 格式、SQL/tool call 小样本。
-2. 若稳定，将相同 direct-load/no-fused 经验迁移到 3B 或恢复 LoRA 环境。
-3. 恢复 7B 推荐先重置 job 镜像或安装与平台匹配的 torch wheel，再重新跑 LoRA SFT。
-4. 配置 SwanLab cloud API key 后，将 `SWANLAB_MODE` 切回 `cloud`。
-5. 评测必须拆分：
-   - 内部统一格式：JSON valid、action accuracy、tool name/args、SQL exact/execution、no-tool/clarify F1。
-   - 官方格式：BFCL、IFEval、GSM8K、MMLU-Pro、WikiSQL/Spider 等，单独报告。
+## 三、训练
+
+### 3.1 配置
+
+```bash
+# 单卡 (推荐，稳定)
+CUDA_VISIBLE_DEVICES=0 python3 train_sft.py
+
+# 多卡 DDP
+torchrun --nproc_per_node=16 train_lora_sft.py
+```
+
+| 参数 | 值 |
+|---|---|
+| Model | Qwen2.5-Coder-7B-Instruct |
+| LoRA | r=32, alpha=64, dropout=0.05 |
+| LR | 2e-6 (SQL), 5e-6 (标准) |
+| Steps | 300-500 |
+| Warmup | 50 steps |
+| BS | 2 (单卡) / 16 (16PPU) |
+| Seq Len | 2048 |
+
+### 3.2 训练脚本模板
+
+```bash
+#!/bin/bash
+set -e
+source /usr/local/PPU_SDK/envsetup.sh  # PPU 环境，普通 GPU 跳过
+export CUDA_VISIBLE_DEVICES=0
+export TRAIN_DATA=/path/to/train.jsonl
+export OUTPUT_DIR=/path/to/output_$(date +%Y%m%d_%H%M%S)
+export SWANLAB_RUN=experiment_name
+mkdir -p $OUTPUT_DIR
+
+python3 train_sft.py 2>&1 | tee -a $OUTPUT_DIR/train.log
+```
+
+## 四、评测
+
+### 4.1 评测矩阵
+
+| 评测 | 格式 | 指标 | 数据路径 |
+|---|---|---|---|
+| BFCL V4 Live | OOD native | Func name accuracy | `bfcl_eval/data/BFCL_v4_live_*.json` |
+| BFCL V3 SQL | OOD native | Func + Exact | `eval_suite/.../BFCL_v3_sql.json` |
+| BFCL Multi-Turn | OOD native | JSON validity | `bfcl_eval/data/BFCL_v4_multi_turn_base.json` |
+| BFCL Web Search | OOD native | JSON validity | `bfcl_eval/data/BFCL_v4_web_search.json` |
+| Self-built Parallel | OOD native | Parallel accuracy | 自建 |
+
+### 4.2 Header→colN 映射（关键！WikiSQL +26~41pp）
+
+模型训练时使用 Spider 等语义化列名（`name`, `age`），但 WikiSQL 评测使用物理列名（`col0`, `col1`）。必须在评测端做映射：
+
+```python
+def remap_headers(sql: str, headers: list) -> str:
+    """Remap display header names to colN identifiers (quoted + unquoted)."""
+    for i, h in enumerate(headers):
+        col = f"col{i}"
+        h_str = str(h).strip()
+        if not h_str or h_str.startswith("col"):
+            continue
+        # Quoted: "DisplayName" -> "colN"
+        sql = sql.replace(chr(34) + h_str + chr(34), chr(34) + col + chr(34))
+        sql = sql.replace(chr(34) + h_str.lower() + chr(34), chr(34) + col + chr(34))
+        sql = sql.replace(chr(34) + h_str.upper() + chr(34), chr(34) + col + chr(34))
+        # Unquoted: bare DisplayName -> colN (word boundary)
+        sql = re.sub(r'\b' + re.escape(h_str) + r'\b', col, sql, flags=re.IGNORECASE)
+    return sql
+
+# 在 extract_sql() 之后、执行之前调用
+if sql is not None and row.get("header"):
+    sql = remap_headers(sql, row["header"])
+```
+
+⚠️ **必须同时处理引号和无引号标识符**。仅处理引号 → +26pp，加上无引号 → +41pp（26.6%→67.6%）。
+
+### 4.3 SQL Exact 评分关键（BFCL V3 旧格式）
+
+```python
+def nv(v):  # 归一化：递归展平嵌套列表
+    if isinstance(v, list):
+        flat = []
+        def _f(x):
+            if isinstance(x, list):
+                for i in x: _f(i)
+            else: flat.append(str(x).strip())
+        _f(v)
+        return ','.join(sorted(flat))
+    return str(v).strip()
+
+# 然后逐参数比较 nv(pred[pk]) == nv(gt[pk])
+```
+
+### 4.3 BFCL Live 评分
+
+```python
+# 提取 model output 中的函数名（支持裸JSON和数组）
+obj = safe_parse(model_output)
+if isinstance(obj, dict): obj = [obj]
+pred_names = set(item.get('name','') for item in obj if isinstance(item, dict))
+expected_names = set(f['name'] for f in function_definitions)
+accuracy = 1 if pred_names & expected_names else 0
+```
+
+## 五、完整流程
+
+```
+1. 数据准备
+   ├── 确认所有数据源格式统一
+   ├── SQL 参数全部双层嵌套
+   ├── 测试集不入训练集
+   └── Prompt 和 completion 格式一致
+
+2. 格式验证（训练前必做）
+   ├── 每个数据源抽1个样例展示
+   ├── 对比训练样例 vs 测试样例格式
+   └── 检查 SQL 参数嵌套是否正确
+
+3. 训练
+   ├── 单卡优先保证稳定性
+   ├── 观察 loss 收敛（7B 模型 step 50-100 内应收敛到 <1.0）
+   └── 异常: loss 卡在 >2.0、step 1 后无进度
+
+4. 评测
+   ├── BFCL Live + SQL + Multi-Turn + Web Search
+   ├── 结果写入 log 文件（nohup > logfile）
+   └── 启动 GPU 占用脚本
+
+5. 结果分析
+   ├── 对比历史最佳
+   ├── 检查 SQL Exact vs Func 差距
+   └── 决定下步方向（GRPO/更多数据/新基座）
+```
+
+## 六、关键教训
+
+| # | 教训 | 后果 |
+|---|---|---|
+| 1 | **测试集绝对不能进训练集** | 虚高 6-12pp |
+| 2 | **prompt 和 completion 必须格式一致** | Exact=0% |
+| 3 | **SQL 参数格式必须对齐评测** | 反复从 59% 降到 18% |
+| 4 | **不要用 regex 提取 SQL 参数** | 基座知识被覆盖 |
+| 5 | **SSH 输出必须 nohup > logfile** | 无数次结果丢失 |
+| 6 | **单卡比 16-PPU DDP 更稳定** | 训练反复崩溃 |
+| 7 | **训练前先验证数据格式** | 节省无效训练时间 |
+| 8 | **Coder7B 的 SQL 知识来自预训练** | 外部 SQL 数据可能污染 |
+
+## 七、详细路径
+
+### 训练集
+
+| 数据集 | 路径 | 数量 | 用途 |
+|---|---|---|---|
+| MCP Smoke 原始 | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/processed/mcp_lora_sft_v3_20260618/sft_v2_all/train_sft.jsonl` | 19,494 | 基础工具选择 |
+| 合成并行 | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/processed/mcp_lora_sft_v3_20260618/sft_clean_parallel/train_clean_parallel.jsonl` | 2,000 | 数组输出 |
+| Spider (SQL) | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/modelscope/spider_train.jsonl` | 7,000 | SQL 生成 |
+| WikiSQL | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/modelscope/wikisql_test.parquet` | 7,500 | SQL 多样性 |
+| HERMES FC | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/modelscope/hermes_fc_v1_train.jsonl` | 1,000 | 工具调用 |
+| Glaive FC v2 | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/modelscope/glaive_fc_v2_train.jsonl` | 1,000 | 工具调用 |
+| SQL Create Context | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/modelscope/sql_create_context.jsonl` | 500 | SQL |
+| **Phase 3 (OOD 全量)** | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/processed/phase3_final/train_phase3.jsonl` | 18,000+ | 零泄漏 |
+| **Phase 4v2 (In-dist)** | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/processed/phase4v2/train_phase4v2.jsonl` | 12,500 | chat_template |
+| GRPO prompt 池 | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/processed/grpo_pool/grpo_prompts.jsonl` | 3,305 | RL 训练 |
+
+### 测试集
+
+| 数据集 | 路径 | 数量 | 指标 |
+|---|---|---|---|
+| BFCL V4 live_simple | `/opt/ac2/lib/python3.12/site-packages/bfcl_eval/data/BFCL_v4_live_simple.json` | 257 | Func name |
+| BFCL V4 live_multiple | `.../BFCL_v4_live_multiple.json` | 1,052 | Func name |
+| BFCL V4 live_parallel | `.../BFCL_v4_live_parallel.json` | 15 | Parallel |
+| BFCL V4 live_parallel_multiple | `.../BFCL_v4_live_parallel_multiple.json` | 23 | Parallel+ |
+| BFCL V3 SQL | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/eval_suite/huggingface/gorilla-llm__Berkeley-Function-Calling-Leaderboard/BFCL_v3_sql.json` | 100 | Func+Exact |
+| BFCL V3 SQL GT | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/eval_suite/.../possible_answer/BFCL_v3_sql.json` | 100 | GT |
+| BFCL V4 Multi-Turn | `/opt/ac2/.../BFCL_v4_multi_turn_base.json` | 200 | JSON |
+| BFCL V4 Web Search | `/opt/ac2/.../BFCL_v4_web_search.json` | 100 | JSON |
+| GSM8K | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/eval_suite/huggingface/openai__gsm8k/main/test-00000-of-00001.parquet` | 1,319 | Math |
+| IFEval | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/eval_suite/huggingface/google__IFEval/ifeval_input_data.jsonl` | 540 | 指令跟随 |
+| HumanEval+ | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/eval_suite/huggingface/openai__openai_humaneval/openai_humaneval/test-00000-of-00001.parquet` | — | 代码 |
+| MBPP | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/eval_suite/huggingface/google-research-datasets__mbpp/` | — | 代码 |
+| SWE-bench Lite | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/datasets/eval_suite/huggingface/SWE-bench__SWE-bench_Lite/` | — | 软件工程 |
+
+### 模型产出
+
+| 模型 | 路径 | BFCL | SQL Exact |
+|---|---|---|---|
+| Round 4 (最佳 BFCL) | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/output/coder7b_round4_sql_sft_20260623_220257/adapter` | 93.2% | 18% |
+| Mixed SFT (最佳 SQL) | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/output/coder7b_mixed_sft_20260621_001502/adapter` | 82.4% | **59%** |
+| Phase 3 (全量 OOD) | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/output/coder7b_phase3_1gpu_20260625_221844/adapter` | 92.6% | 24% |
+| Phase 4v2 (In-dist) | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/output/coder7b_phase4_1gpu_*/adapter` | 🔵训练中 | — |
+| 1.5B GRPO | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/output/grpo_15b_dpo_20260621_153153/adapter` | 83.5% | 17% |
+
+### 评测脚本
+
+| 脚本 | 绝对路径 |
+|---|---|
+| SQL 评测 (nv归一化) | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/scripts/eval_sql_fixed.py` |
+| BFCL Live + SQL 联合 | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/scripts/eval_coder7b.py` |
+| Phase 4 In-dist | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/scripts/eval_phase4.py` |
+| DeepSeek API 评测 | 本地: `C:/Users/Xpeng/run_deepseek_eval.py` |
+| 数据构建 Phase 3 | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/scripts/build_phase3_final.py` |
+| 数据构建 Phase 4v2 | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/scripts/build_p4v2_final.py` |
+| 训练启动单卡 | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/scripts/train_coder7b_sft.py` |
+| 训练启动多卡 | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/scripts/remote/train_lora_sft.py` |
+| GRPO 训练 | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/scripts/train_grpo_c7b_fixed.py` |
+| GPU 占用 | `/code/run_gpu_16.sh` |
+
+### 文档
+
+| 文档 | 绝对路径 |
+|---|---|
+| 流程指南 | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/docs/pipeline_guide.md` |
+| 实验记录 | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/docs/07_experiment_records.md` |
+| 周报 | `/workspace/yans2@xiaopeng.com/agentic_rl_pipeline/docs/weekly_report_2026-06-22.md` |
+| 周报 | `docs/weekly_report_2026-06-22.md` |
+| 训练计划 Round 2 | `docs/training_plan_round2.md` |
+
+## 八、最新结果 (2026-07-05)
+
+### Phase27: 轻量 SFT + Header→colN 映射
+
+最佳 WikiSQL 执行准确率: **67.6%**
+
+```
+Phase27 轻量 SFT (3K 样本, 200步) → 53.9% baseline
+  + 引号 header remap           → 61.3%
+  + 无引号 header remap         → 67.6% (最终)
+```
+
+### 关键发现
+
+1. **87% 的 SQL 错误是列名混淆**（显示名 vs 物理 colN）
+2. **GRPO 在 SFT 收敛后无效**：三种 GRPO 配置（dense/binary/不同步数）都只变 <1pp
+3. **3K 样本比 15K 更好**：过量 SFT 锁死模型，GRPO 无优化空间
+4. **引号+无引号 remap 缺一不可**：仅引号 52.7%，加上无引号 70.7%（离线验证），正式版 67.6%
